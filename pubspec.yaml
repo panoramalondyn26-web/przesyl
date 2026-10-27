@@ -1,0 +1,18 @@
+name: przesyl
+description: Przesyłanie plików między Makiem a Androidem w sieci Wi-Fi.
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  # file_selector i path_provider dopisuje skrypt setup.sh (najnowsze wersje)
+
+dev_dependencies:
+  flutter_lints: ">=3.0.0"
+
+flutter:
+  uses-material-design: true
