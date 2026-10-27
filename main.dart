@@ -299,9 +299,9 @@ class _HomePageState extends State<HomePage> {
                   ),
                   const SizedBox(height: 2),
                   Text('IP: $ips', style: TextStyle(color: cs.onPrimaryContainer)),
-                  if (service.saveDir != null)
+                  if (service.saveLabel.isNotEmpty)
                     Text(
-                      'Zapis: ${service.saveDir!.path}',
+                      'Zapis: ${service.saveLabel}',
                       maxLines: 2,
                       overflow: TextOverflow.ellipsis,
                       style: Theme.of(context).textTheme.bodySmall?.copyWith(

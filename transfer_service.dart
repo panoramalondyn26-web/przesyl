@@ -10,11 +10,13 @@ import 'dart:math';
 
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 
 const int kHttpPort = 53317;
 const int kDiscoveryPort = 53318;
 const String kTag = 'przesyl-v1';
+const _media = MethodChannel('przesyl/media');
 
 class Peer {
   Peer({
@@ -55,7 +57,7 @@ class ReceivedFile {
   final int size;
   final String from;
   final DateTime time;
-  String get name => path.split(Platform.pathSeparator).last;
+  String get name => path.split('/').last;
 }
 
 class TransferProgress {
@@ -132,6 +134,8 @@ class TransferService extends ChangeNotifier {
     ..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
 
   int get httpPort => _server?.port ?? 0;
+
+  String get saveLabel => Platform.isAndroid ? 'Pobrane/Przesyl' : (saveDir?.path ?? '');
 
   static String get osName {
     if (Platform.isAndroid) return 'android';
@@ -212,18 +216,10 @@ class TransferService extends ChangeNotifier {
 
   Future<Directory> _resolveSaveDir() async {
     if (Platform.isAndroid) {
-      // Publiczny folder Pobrane/Przesyl (Android 11+). Jeśli się nie da,
-      // zapisujemy w folderze aplikacji.
-      final pub = Directory('/storage/emulated/0/Download/Przesyl');
-      try {
-        await pub.create(recursive: true);
-        final test = File('${pub.path}/.przesyl_test');
-        await test.writeAsString('ok');
-        await test.delete();
-        return pub;
-      } catch (_) {}
-      final base = await getExternalStorageDirectory() ?? await getApplicationDocumentsDirectory();
-      final d = Directory('${base.path}/Przesyl');
+      // Na Androidzie plik trafia najpierw do folderu tymczasowego,
+      // a po odebraniu kopiujemy go do Pobrane/Przesyl (MainActivity.kt).
+      final tmp = await getTemporaryDirectory();
+      final d = Directory('${tmp.path}/incoming');
       await d.create(recursive: true);
       return d;
     }
@@ -519,9 +515,27 @@ class TransferService extends ChangeNotifier {
       return;
     }
 
+    var shownPath = file.path;
+    if (Platform.isAndroid) {
+      try {
+        shownPath = await _media.invokeMethod<String>(
+              'saveToDownloads',
+              {'path': file.path, 'name': meta.name},
+            ) ??
+            file.path;
+      } catch (e) {
+        try {
+          await file.delete();
+        } catch (_) {}
+        _endSession(token);
+        await _json(req.response, 500, {'error': 'save failed: $e'});
+        return;
+      }
+    }
+
     s.done.add(index);
     s.bytesDone += got;
-    received.insert(0, ReceivedFile(file.path, got, s.offer.senderName, DateTime.now()));
+    received.insert(0, ReceivedFile(shownPath, got, s.offer.senderName, DateTime.now()));
     if (s.done.length == s.offer.files.length) {
       _endSession(token);
     } else {
