@@ -26,6 +26,10 @@ jobs:
           flutter create --org com.przesyl --project-name przesyl --platforms=android .
           rm -f test/widget_test.dart
           flutter pub add file_selector path_provider
+          MA=$(find android/app/src/main -name 'MainActivity.*' | head -n1)
+          echo "Zastępuję $MA"
+          rm -f "$MA"
+          cp MainActivity.kt "$(dirname "$MA")/MainActivity.kt"
           M=android/app/src/main/AndroidManifest.xml
           perl -0pi -e 's|<application|<uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>\n    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>\n    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE"/>\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28"/>\n    <application android:usesCleartextTraffic="true" android:requestLegacyExternalStorage="true"|' "$M"
           perl -pi -e 's|android:label="przesyl"|android:label="Przesył"|' "$M"
