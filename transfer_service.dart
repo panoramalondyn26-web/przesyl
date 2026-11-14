@@ -8,7 +8,6 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 
-import 'package:file_selector/file_selector.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
@@ -36,6 +35,14 @@ class Peer {
   int port;
   DateTime lastSeen;
   bool manual;
+}
+
+/// Plik wybrany do wysłania (czytany strumieniowo z dysku – bez ładowania do pamięci).
+class SendItem {
+  SendItem(this.path, this.name);
+  final String path;
+  final String name;
+  File get file => File(path);
 }
 
 class OfferedFile {
@@ -108,6 +115,7 @@ class _Session {
   final IncomingOffer offer;
   final Set<int> done = {};
   int bytesDone = 0;
+  int active = 0; // ile plików właśnie się odbiera / zapisuje
   DateTime lastActivity;
 }
 
@@ -140,6 +148,7 @@ class TransferService extends ChangeNotifier {
   static String get osName {
     if (Platform.isAndroid) return 'android';
     if (Platform.isMacOS) return 'macos';
+    if (Platform.isWindows) return 'windows';
     return Platform.operatingSystem;
   }
 
@@ -187,8 +196,22 @@ class TransferService extends ChangeNotifier {
     super.dispose();
   }
 
+  bool _awake = false;
+
   void _notify() {
-    if (!_disposed) notifyListeners();
+    if (_disposed) return;
+    _updateAwake();
+    notifyListeners();
+  }
+
+  /// Na Androidzie nie pozwalamy zgasnąć ekranowi w trakcie przesyłu
+  /// (inaczej telefon potrafi uśpić Wi-Fi i przerwać duży film).
+  void _updateAwake() {
+    if (!Platform.isAndroid) return;
+    final busy = sending != null || receiving != null;
+    if (busy == _awake) return;
+    _awake = busy;
+    _media.invokeMethod('keepAwake', busy).catchError((_) => null);
   }
 
   void _progressNotify({bool force = false}) {
@@ -211,7 +234,8 @@ class TransferService extends ChangeNotifier {
     if (Platform.isAndroid) return 'Android ${id.substring(0, 4).toUpperCase()}';
     var h = Platform.localHostname;
     if (h.endsWith('.local')) h = h.substring(0, h.length - 6);
-    return h.isEmpty ? 'Mac' : h;
+    if (h.isEmpty) return Platform.isWindows ? 'Komputer' : 'Mac';
+    return h;
   }
 
   Future<Directory> _resolveSaveDir() async {
@@ -272,6 +296,9 @@ class TransferService extends ChangeNotifier {
     final targets = <String>{
       '255.255.255.255',
       for (final ip in localIps) _subnetBroadcast(ip),
+      // urządzenia dodane ręcznie / kodem QR – wysyłamy wprost do nich
+      for (final p in _peers.values)
+        if (p.manual) p.address.address,
     };
     for (final t in targets) {
       _sendUdp(msg, InternetAddress(t));
@@ -333,7 +360,7 @@ class TransferService extends ChangeNotifier {
 
   /// Ręczne dodanie urządzenia, gdy automatyczne wykrywanie nie działa
   /// (np. sieć firmowa / hotelowa blokuje broadcast).
-  Future<bool> addByIp(String ip) async {
+  Future<bool> addByIp(String ip, {int port = kHttpPort}) async {
     final addr = InternetAddress.tryParse(ip.trim());
     if (addr == null || addr.type != InternetAddressType.IPv4) {
       throw TransferException('Nieprawidłowy adres IP');
@@ -343,7 +370,7 @@ class TransferService extends ChangeNotifier {
     final client = HttpClient()..connectionTimeout = const Duration(seconds: 3);
     try {
       final req = await client.getUrl(
-        Uri(scheme: 'http', host: addr.address, port: kHttpPort, path: '/info'),
+        Uri(scheme: 'http', host: addr.address, port: port, path: '/info'),
       );
       final res = await req.close().timeout(const Duration(seconds: 4));
       final data = jsonDecode(await utf8.decodeStream(res)) as Map<String, dynamic>;
@@ -357,7 +384,7 @@ class TransferService extends ChangeNotifier {
       client.close(force: true);
     }
 
-    await Future<void>.delayed(const Duration(milliseconds: 1500));
+    await Future<void>.delayed(const Duration(milliseconds: 1200));
     for (final p in _peers.values) {
       if (p.address.address == addr.address) {
         p.manual = true;
@@ -366,6 +393,43 @@ class TransferService extends ChangeNotifier {
       }
     }
     return false;
+  }
+
+  /// Treść kodu QR: adresy i port tego urządzenia.
+  String get qrPayload => jsonEncode({
+        't': 'przesyl',
+        'ips': localIps,
+        'p': httpPort,
+        'n': deviceName,
+      });
+
+  /// Łączy się z urządzeniem z zeskanowanego kodu QR. Zwraca jego nazwę.
+  Future<String> connectFromQr(String raw) async {
+    Map<String, dynamic> m;
+    try {
+      m = jsonDecode(raw) as Map<String, dynamic>;
+    } catch (_) {
+      throw TransferException('To nie jest kod Przesyłu');
+    }
+    if (m['t'] != 'przesyl') throw TransferException('To nie jest kod Przesyłu');
+    final ips = [for (final i in (m['ips'] as List? ?? const [])) '$i'];
+    final port = (m['p'] as num?)?.toInt() ?? kHttpPort;
+    final name = '${m['n'] ?? 'urządzenie'}';
+    // Najpierw adresy z tej samej podsieci co my.
+    final mySubnets = {for (final ip in localIps) _subnetBroadcast(ip)};
+    ips.sort((a, b) {
+      final sa = mySubnets.contains(_subnetBroadcast(a)) ? 0 : 1;
+      final sb = mySubnets.contains(_subnetBroadcast(b)) ? 0 : 1;
+      return sa - sb;
+    });
+    for (final ip in ips) {
+      try {
+        if (await addByIp(ip, port: port)) return name;
+      } catch (_) {}
+    }
+    throw TransferException(
+      'Nie udało się połączyć z $name. Sprawdź, czy oba urządzenia są w tej samej sieci Wi-Fi.',
+    );
   }
 
   void _housekeeping() {
@@ -377,7 +441,9 @@ class TransferService extends ChangeNotifier {
     var changed = before != _peers.length;
 
     final staleSessions = _sessions.entries
-        .where((e) => now.difference(e.value.lastActivity) > const Duration(seconds: 60))
+        .where((e) =>
+            e.value.active == 0 &&
+            now.difference(e.value.lastActivity) > const Duration(minutes: 3))
         .map((e) => e.key)
         .toList();
     if (staleSessions.isNotEmpty) {
@@ -473,6 +539,22 @@ class TransferService extends ChangeNotifier {
       return;
     }
     final meta = s.offer.files[index];
+    s.active++;
+    try {
+      await _receiveOne(req, token, s, index, meta);
+    } finally {
+      s.active--;
+      s.lastActivity = DateTime.now();
+    }
+  }
+
+  Future<void> _receiveOne(
+    HttpRequest req,
+    String token,
+    _Session s,
+    int index,
+    OfferedFile meta,
+  ) async {
     final file = await _uniqueFile(saveDir!, meta.name);
     final sink = file.openWrite();
     var got = 0;
@@ -546,7 +628,7 @@ class TransferService extends ChangeNotifier {
 
   // -------------------------------------------------------------------- sending
 
-  Future<void> sendFiles(Peer peer, List<XFile> files) async {
+  Future<void> sendFiles(Peer peer, List<SendItem> files) async {
     if (sending != null) throw TransferException('Trwa już inne wysyłanie');
     if (files.isEmpty) return;
 
@@ -562,7 +644,7 @@ class TransferService extends ChangeNotifier {
     try {
       final sizes = <int>[];
       for (final f in files) {
-        sizes.add(await f.length());
+        sizes.add(await f.file.length());
       }
       final total = sizes.fold<int>(0, (a, b) => a + b);
 
@@ -611,14 +693,16 @@ class TransferService extends ChangeNotifier {
         req.contentLength = sizes[i];
         req.headers.contentType = ContentType.binary;
         var sent = 0;
-        await req.addStream(f.openRead().map((chunk) {
+        await req.addStream(f.file.openRead().map((chunk) {
           sent += chunk.length;
           sending = sending!.copyWith(done: base + sent);
           _progressNotify();
           return chunk;
         }));
+        // Odbiorca po otrzymaniu dużego filmu musi go jeszcze zapisać,
+        // więc dajemy mu dużo czasu na odpowiedź.
         final res = await req.close().timeout(
-              const Duration(minutes: 2),
+              const Duration(minutes: 30),
               onTimeout: () => throw TransferException('Przekroczono czas przy ${f.name}'),
             );
         await res.drain<void>();

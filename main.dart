@@ -1,7 +1,9 @@
 import 'dart:io';
 
-import 'package:file_selector/file_selector.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:mobile_scanner/mobile_scanner.dart';
+import 'package:qr_flutter/qr_flutter.dart';
 
 import 'transfer_service.dart';
 
@@ -107,13 +109,108 @@ class _HomePageState extends State<HomePage> {
     return result ?? false;
   }
 
+  bool _preparing = false;
+
   Future<void> _sendTo(Peer peer) async {
-    if (service.sending != null) return;
-    final files = await openFiles();
+    if (service.sending != null || _preparing) return;
+    // Na Androidzie wybrane pliki (np. długie filmy) są najpierw kopiowane
+    // do pamięci podręcznej – pokazujemy wtedy „Przygotowuję pliki…”.
+    setState(() => _preparing = true);
+    List<SendItem> files;
+    try {
+      final res = await FilePicker.platform.pickFiles(
+        allowMultiple: true,
+        withData: false,
+        withReadStream: false,
+      );
+      files = [
+        for (final f in res?.files ?? const <PlatformFile>[])
+          if (f.path != null) SendItem(f.path!, f.name),
+      ];
+    } catch (e) {
+      if (mounted) setState(() => _preparing = false);
+      _snack('Nie udało się otworzyć plików: $e', error: true);
+      return;
+    }
+    if (mounted) setState(() => _preparing = false);
     if (files.isEmpty) return;
     try {
       await service.sendFiles(peer, files);
       _snack('Wysłano ${files.length} ${plikiPlural(files.length)} do ${peer.name} ✓');
+    } catch (e) {
+      _snack('$e', error: true);
+    } finally {
+      if (Platform.isAndroid) {
+        try {
+          await FilePicker.platform.clearTemporaryFiles();
+        } catch (_) {}
+      }
+    }
+  }
+
+  // ------------------------------------------------------------------ kod QR
+
+  bool get _canScan => Platform.isAndroid;
+
+  void _showMyQr() {
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => ListenableBuilder(
+        listenable: service,
+        builder: (ctx, _) => AlertDialog(
+          title: const Text('Zeskanuj telefonem'),
+          content: SizedBox(
+            width: 300,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (service.localIps.isEmpty)
+                  const Padding(
+                    padding: EdgeInsets.all(24),
+                    child: Text('Brak połączenia z siecią Wi-Fi.'),
+                  )
+                else
+                  Container(
+                    color: Colors.white,
+                    padding: const EdgeInsets.all(12),
+                    child: QrImageView(
+                      data: service.qrPayload,
+                      size: 240,
+                      backgroundColor: Colors.white,
+                    ),
+                  ),
+                const SizedBox(height: 12),
+                Text(
+                  'Na drugim urządzeniu otwórz Przesył i stuknij ikonę skanera '
+                  '(aparat na górze ekranu).',
+                  textAlign: TextAlign.center,
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  '${service.deviceName} · ${service.localIps.join(', ')}',
+                  textAlign: TextAlign.center,
+                  style: Theme.of(ctx).textTheme.bodySmall,
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            FilledButton(onPressed: () => Navigator.pop(ctx), child: const Text('Gotowe')),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _scanQr() async {
+    final raw = await Navigator.of(context).push<String>(
+      MaterialPageRoute(builder: (_) => const ScanPage()),
+    );
+    if (raw == null) return;
+    _snack('Łączę…');
+    try {
+      final name = await service.connectFromQr(raw);
+      _snack('Połączono z $name ✓');
     } catch (e) {
       _snack('$e', error: true);
     }
@@ -177,10 +274,16 @@ class _HomePageState extends State<HomePage> {
     if (name != null) service.rename(name);
   }
 
+  bool get _canReveal => Platform.isMacOS || Platform.isWindows;
+
   Future<void> _reveal(String path, {bool select = false}) async {
-    if (!Platform.isMacOS) return;
     try {
-      await Process.run('open', [if (select) '-R', path]);
+      if (Platform.isMacOS) {
+        await Process.run('open', [if (select) '-R', path]);
+      } else if (Platform.isWindows) {
+        final win = path.replaceAll('/', '\\');
+        await Process.run('explorer', [if (select) '/select,$win' else win]);
+      }
     } catch (_) {}
   }
 
@@ -208,6 +311,17 @@ class _HomePageState extends State<HomePage> {
           appBar: AppBar(
             title: const Text('Przesył'),
             actions: [
+              if (_canScan)
+                IconButton(
+                  tooltip: 'Skanuj kod QR',
+                  icon: const Icon(Icons.qr_code_scanner),
+                  onPressed: _scanQr,
+                ),
+              IconButton(
+                tooltip: 'Mój kod QR',
+                icon: const Icon(Icons.qr_code_2),
+                onPressed: _showMyQr,
+              ),
               IconButton(
                 tooltip: 'Dodaj po adresie IP',
                 icon: const Icon(Icons.add_link),
@@ -225,6 +339,7 @@ class _HomePageState extends State<HomePage> {
                   children: [
                     _selfCard(context),
                     if (service.startError != null) _errorCard(context, service.startError!),
+                    if (_preparing && service.sending == null) _preparingCard(),
                     if (service.sending != null) _progressCard(context, service.sending!, true),
                     if (service.receiving != null)
                       _progressCard(context, service.receiving!, false),
@@ -270,7 +385,13 @@ class _HomePageState extends State<HomePage> {
             CircleAvatar(
               backgroundColor: cs.primary,
               foregroundColor: cs.onPrimary,
-              child: Icon(Platform.isAndroid ? Icons.phone_android : Icons.laptop_mac),
+              child: Icon(
+                Platform.isAndroid
+                    ? Icons.phone_android
+                    : Platform.isWindows
+                        ? Icons.desktop_windows
+                        : Icons.laptop_mac,
+              ),
             ),
             const SizedBox(width: 14),
             Expanded(
@@ -311,7 +432,7 @@ class _HomePageState extends State<HomePage> {
                 ],
               ),
             ),
-            if (Platform.isMacOS && service.saveDir != null)
+            if (_canReveal && service.saveDir != null)
               IconButton(
                 tooltip: 'Otwórz folder',
                 icon: Icon(Icons.folder_open, color: cs.onPrimaryContainer),
@@ -375,6 +496,20 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
+  Widget _preparingCard() {
+    return const Card(
+      child: ListTile(
+        leading: SizedBox(
+          width: 22,
+          height: 22,
+          child: CircularProgressIndicator(strokeWidth: 2),
+        ),
+        title: Text('Przygotowuję pliki…'),
+        subtitle: Text('Przy długich filmach może to chwilę potrwać.'),
+      ),
+    );
+  }
+
   Widget _searchingCard(BuildContext context) {
     return Card(
       child: Padding(
@@ -397,14 +532,22 @@ class _HomePageState extends State<HomePage> {
             const Text(
               'Uruchom Przesył na drugim urządzeniu. Oba muszą być w tej samej sieci Wi-Fi.',
             ),
-            const SizedBox(height: 4),
-            Align(
-              alignment: Alignment.centerLeft,
-              child: TextButton.icon(
-                onPressed: _addByIp,
-                icon: const Icon(Icons.add_link),
-                label: const Text('Nie widać? Dodaj po adresie IP'),
-              ),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 4,
+              children: [
+                FilledButton.tonalIcon(
+                  onPressed: _canScan ? _scanQr : _showMyQr,
+                  icon: Icon(_canScan ? Icons.qr_code_scanner : Icons.qr_code_2),
+                  label: Text(_canScan ? 'Skanuj kod QR' : 'Pokaż kod QR'),
+                ),
+                TextButton.icon(
+                  onPressed: _addByIp,
+                  icon: const Icon(Icons.add_link),
+                  label: const Text('Dodaj po IP'),
+                ),
+              ],
             ),
           ],
         ),
@@ -417,6 +560,7 @@ class _HomePageState extends State<HomePage> {
     final icon = switch (p.os) {
       'android' => Icons.phone_android,
       'macos' => Icons.laptop_mac,
+      'windows' => Icons.desktop_windows,
       _ => Icons.devices,
     };
     return Card(
@@ -445,8 +589,8 @@ class _HomePageState extends State<HomePage> {
         leading: Icon(iconFor(f.name)),
         title: Text(f.name, overflow: TextOverflow.ellipsis),
         subtitle: Text('od ${f.from} · ${formatBytes(f.size)} · $hh:$mm'),
-        trailing: Platform.isMacOS ? const Icon(Icons.chevron_right) : null,
-        onTap: Platform.isMacOS ? () => _reveal(f.path, select: true) : null,
+        trailing: _canReveal ? const Icon(Icons.chevron_right) : null,
+        onTap: _canReveal ? () => _reveal(f.path, select: true) : null,
       ),
     );
   }
@@ -487,4 +631,57 @@ IconData iconFor(String name) {
   if (ext == 'pdf') return Icons.picture_as_pdf_outlined;
   if (ext == 'apk') return Icons.android;
   return Icons.insert_drive_file_outlined;
+}
+
+// ---------------------------------------------------------------- skaner QR
+
+class ScanPage extends StatefulWidget {
+  const ScanPage({super.key});
+
+  @override
+  State<ScanPage> createState() => _ScanPageState();
+}
+
+class _ScanPageState extends State<ScanPage> {
+  bool _done = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Zeskanuj kod Przesyłu')),
+      body: Stack(
+        children: [
+          MobileScanner(
+            onDetect: (capture) {
+              if (_done) return;
+              for (final b in capture.barcodes) {
+                final v = b.rawValue;
+                if (v != null && v.contains('przesyl')) {
+                  _done = true;
+                  Navigator.of(context).pop(v);
+                  return;
+                }
+              }
+            },
+          ),
+          Align(
+            alignment: Alignment.bottomCenter,
+            child: Container(
+              margin: const EdgeInsets.all(24),
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              decoration: BoxDecoration(
+                color: Colors.black.withValues(alpha: 0.6),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: const Text(
+                'Na komputerze kliknij ikonę kodu QR i skieruj na nią aparat.',
+                textAlign: TextAlign.center,
+                style: TextStyle(color: Colors.white),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 }

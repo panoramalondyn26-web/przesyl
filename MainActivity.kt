@@ -1,6 +1,10 @@
 package com.przesyl.przesyl
 
 import android.content.ContentValues
+import android.content.Context
+import android.net.wifi.WifiManager
+import android.os.Bundle
+import android.view.WindowManager
 import android.media.MediaScannerConnection
 import android.os.Build
 import android.os.Environment
@@ -14,6 +18,30 @@ import java.io.File
 // Zapisuje odebrane pliki do publicznego folderu Pobrane/Przesyl,
 // tak żeby były widoczne w aplikacji Pliki i w Galerii.
 class MainActivity : FlutterActivity() {
+    // Bez tej blokady wiele telefonów odrzuca pakiety rozgłoszeniowe,
+    // przez co urządzenia się nie widzą.
+    private var multicastLock: WifiManager.MulticastLock? = null
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        try {
+            val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            multicastLock = wifi.createMulticastLock("przesyl").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        } catch (e: Exception) {
+        }
+    }
+
+    override fun onDestroy() {
+        try {
+            multicastLock?.release()
+        } catch (e: Exception) {
+        }
+        super.onDestroy()
+    }
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "przesyl/media")
@@ -33,6 +61,14 @@ class MainActivity : FlutterActivity() {
                             runOnUiThread { result.error("SAVE", e.message, null) }
                         }
                     }.start()
+                } else if (call.method == "keepAwake") {
+                    val on = call.arguments as? Boolean ?: false
+                    if (on) {
+                        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                    } else {
+                        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                    }
+                    result.success(null)
                 } else {
                     result.notImplemented()
                 }
