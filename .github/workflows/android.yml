@@ -1,44 +1,80 @@
-name: Zbuduj APK
+name: Zbuduj aplikacje
 on:
   push:
   workflow_dispatch:
 
 jobs:
-  build:
+  android:
+    name: Android (APK)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
-
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
-
-      - name: Przygotuj projekt Android
-        run: |
-          mkdir -p lib
-          [ -f main.dart ] && mv main.dart lib/
-          [ -f transfer_service.dart ] && mv transfer_service.dart lib/
-          flutter create --org com.przesyl --project-name przesyl --platforms=android .
-          rm -f test/widget_test.dart
-          flutter pub add file_selector path_provider
-          MA=$(find android/app/src/main -name 'MainActivity.*' | head -n1)
-          echo "Zastępuję $MA"
-          rm -f "$MA"
-          cp MainActivity.kt "$(dirname "$MA")/MainActivity.kt"
-          M=android/app/src/main/AndroidManifest.xml
-          perl -0pi -e 's|<application|<uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>\n    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>\n    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE"/>\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28"/>\n    <application android:usesCleartextTraffic="true" android:requestLegacyExternalStorage="true"|' "$M"
-          perl -pi -e 's|android:label="przesyl"|android:label="Przesył"|' "$M"
-          cat "$M"
-
+          cache: true
+      - name: Przygotuj projekt
+        run: bash ci_setup.sh android
       - name: Zbuduj APK
-        run: flutter build apk --release
-
+        run: |
+          flutter build apk --release
+          mkdir -p dist
+          cp build/app/outputs/flutter-apk/app-release.apk dist/Przesyl.apk
       - uses: actions/upload-artifact@v4
         with:
-          name: przesyl-apk
-          path: build/app/outputs/flutter-apk/app-release.apk
+          name: Przesyl-Android
+          path: dist/Przesyl.apk
+
+  macos:
+    name: Mac (DMG)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Przygotuj projekt
+        run: bash ci_setup.sh macos
+      - name: Zbuduj aplikację
+        run: flutter build macos --release
+      - name: Spakuj do DMG
+        run: |
+          mkdir -p dmg dist
+          cp -R build/macos/Build/Products/Release/przesyl.app "dmg/Przesył.app"
+          ln -s /Applications "dmg/Aplikacje"
+          hdiutil create -volname "Przesył" -srcfolder dmg -ov -format UDZO dist/Przesyl-Mac.dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Przesyl-Mac
+          path: dist/Przesyl-Mac.dmg
+
+  windows:
+    name: Windows (instalator)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Przygotuj projekt
+        shell: bash
+        run: bash ci_setup.sh windows
+      - name: Zbuduj aplikację
+        run: flutter build windows --release
+      - name: Zbuduj instalator
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          & $iscc installer.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Przesyl-Windows
+          path: dist/Przesyl-Windows-Instalator.exe
